@@ -25,5 +25,4 @@ pub fn build(b: *Build) void {
 	const run_exe = b.addRunArtifact(exe);
 	const run_step = b.step("run", "Run the program");
 	run_step.dependOn(&run_exe.step);
-
 }

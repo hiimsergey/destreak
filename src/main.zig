@@ -2,7 +2,6 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 const AllocatorWrapper = @import("allocator.zig").AllocatorWrapper;
-const data = @import("data.zig");
 
 var stderr_buf: [1024]u8 = undefined;
 var stdout_buf: [1024]u8 = undefined;
@@ -12,27 +11,64 @@ var stdout = std.fs.File.stdout().writer(&stdout_buf);
 pub fn eql(a: []const u8, b: []const u8) bool {
 	return std.mem.eql(u8, a, b);
 }
-fn println(comptime fmt: []const u8, args: anytype) void {
-	stdout.interface.print(fmt ++ "\n", args) catch {};
-}
 pub fn errln(comptime msg: []const u8, args: anytype) void {
 	stderr.interface.print("\x1b[31m" ++ msg ++ "\n", args) catch {};
 	stderr.interface.flush() catch {};
 }
+fn println(comptime fmt: []const u8, args: anytype) void {
+	stdout.interface.print(fmt ++ "\n", args) catch {};
+}
 
+pub fn open_datadir(allocator: Allocator) !std.fs.Dir {
+	const dirpath = std.process.getEnvVarOwned(allocator, "XDG_DATA_HOME") catch blk: {
+		const home = try std.process.getEnvVarOwned(allocator, "HOME");
+		defer allocator.free(home);
+		break :blk try std.mem.concat(allocator, u8, &.{home, "/.local/share"});
+	};
+	defer allocator.free(dirpath);
+
+	return try std.fs.openDirAbsolute(dirpath, .{});
+}
+
+fn open_datafile(allocator: Allocator) !std.fs.File {
+	var dir = try open_datadir(allocator);
+	defer dir.close();
+	return try dir.createFile("destreak.bin", .{ .read = true, .truncate = false });
+}
+
+// TODO NOW DEBUG some EOF problems
 fn list(allocator: Allocator) !void {
-	var datafile = try data.open_datafile(allocator);
+	var datafile = try open_datafile(allocator);
 	defer datafile.close();
 
-	var streaks = try data.parse(allocator, datafile);
-	defer streaks.deinit(allocator);
+	var reader_buf: [1024]u8 = undefined;
+	var reader = datafile.reader(&reader_buf);
 
 	const now = std.time.timestamp();
+	var len_decr: u8 = undefined;
+	var title: []u8 = &.{};
+	defer allocator.free(title);
+	var time: i64 = undefined;
+	while (true) {
+		_ = reader.readStreaming(@ptrCast(&len_decr)) catch |err| switch (err) {
+			error.EndOfStream => break,
+			else => return err
+		};
+		title = try allocator.realloc(title, len_decr + 1);
+		_ = reader.read(title) catch |err| {
+			errln("TODO fuck 0 {s}", .{@errorName(err)});
+			return err;
+		};
 
-	for (streaks.list.items) |item| {
-		const days_since: usize =
-			@intCast(@divFloor(now - item.time, std.time.s_per_day));
-		println("{d:>4}  {s}", .{days_since, item.name});
+		_ = reader.read(@ptrCast(&time)) catch |err| {
+			errln("TODO fuck 1", .{});
+			return err;
+		};
+		// TODO FINAL TEST
+		const days_since: u32 =
+			@intCast(@divFloor(now - time, std.time.s_per_day));
+
+		println("{d:>4}  {s}", .{days_since, title});
 	}
 }
 
@@ -46,17 +82,37 @@ fn new(allocator: Allocator, entry: ?[]const u8) !void {
 		return error.Generic;
 	}
 
-	var datafile = try data.open_datafile(allocator);
+	var datafile = try open_datafile(allocator);
 	defer datafile.close();
 
-	var streaks = try data.parse(allocator, datafile);
-	defer streaks.deinit(allocator);
+	var reader_buf: [1024]u8 = undefined;
+	var reader = datafile.reader(&reader_buf);
 
-	for (streaks.list.items) |item| if (eql(item.name, entry.?)) {
-		errln("'{s}' is already registered!", .{item.name});
+	// TODO TEST
+	// Check if entry already exists
+	var len_decr: u8 = undefined;
+	const title = try allocator.alloc(u8, entry.?.len);
+	defer allocator.free(title);
+	while (true) {
+		_ = reader.readStreaming(@ptrCast(&len_decr)) catch |err| switch (err) {
+			error.EndOfStream => break,
+			else => return err
+		};
+		if (len_decr + 1 != entry.?.len) {
+			try reader.seekBy(@intCast(len_decr + 1 + @sizeOf(i64)));
+			continue;
+		}
+		_ = try reader.read(title);
+		if (!eql(title, entry.?)) {
+			try reader.seekBy(@intCast(@sizeOf(i64)));
+			continue;
+		}
+
+		errln("'{s}' is already registered!", .{entry.?});
 		return error.Generic;
-	};
+	}
 
+	// Entry doesn't exist yet, so add it.
 	const now = std.time.timestamp();
 
 	var writer_buf: [1024]u8 = undefined;
@@ -78,10 +134,50 @@ fn delete(allocator: Allocator, entry: ?[]const u8) !void {
 		return error.Generic;
 	}
 
-	var datafile = try data.open_datafile(allocator);
-	defer datafile.close();
+	var file = try open_datafile(allocator);
+	defer file.close();
 
-	return try data.delete_entry(allocator, datafile, entry.?);
+	var reader_buf: [1024]u8 = undefined;
+	var writer_buf: [1024]u8 = undefined;
+	var reader = file.reader(&reader_buf);
+	var writer = file.writer(&writer_buf);
+
+	const title = try allocator.alloc(u8, entry.?.len);
+	defer allocator.free(title);
+
+	var len_decr: u8 = undefined;
+	while (true) {
+		_ = reader.readStreaming(@ptrCast(&len_decr)) catch |err| switch (err) {
+			error.EndOfStream => break,
+			else => return err
+		};
+		if (len_decr + 1 != entry.?.len) {
+			try reader.seekBy(@intCast(len_decr + 1 + @sizeOf(i64)));
+			continue;
+		}
+		_ = try reader.read(title);
+		if (!eql(title, entry.?)) {
+			try reader.seekBy(@intCast(@sizeOf(i64)));
+			continue;
+		}
+
+		try writer.seekTo(reader.logicalPos() - @sizeOf(u8) - entry.?.len);
+		var copy_buf: [1024]u8 = undefined;
+		var n: usize = undefined;
+		while (true) {
+			n = reader.readStreaming(&copy_buf) catch |err| switch (err) {
+				error.EndOfStream => break,
+				else => return err
+			};
+			_ = try writer.interface.write(copy_buf[0..n]);
+		}
+		try writer.interface.flush();
+		try file.setEndPos(writer.pos);
+		return;
+	}
+
+	// TODO TEST
+	errln("No such activity '{s}'", .{entry.?});
 }
 
 fn help() void {
