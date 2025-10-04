@@ -30,7 +30,7 @@ pub fn open_datadir(allocator: Allocator) !std.fs.Dir {
 	return try std.fs.openDirAbsolute(dirpath, .{});
 }
 
-fn open_datafile(allocator: Allocator) !std.fs.File {
+fn open_file(allocator: Allocator) !std.fs.File {
 	var dir = try open_datadir(allocator);
 	defer dir.close();
 	return try dir.createFile("destreak.bin", .{ .read = true, .truncate = false });
@@ -38,11 +38,11 @@ fn open_datafile(allocator: Allocator) !std.fs.File {
 
 // TODO NOW DEBUG some EOF problems
 fn list(allocator: Allocator) !void {
-	var datafile = try open_datafile(allocator);
-	defer datafile.close();
+	var file = try open_file(allocator);
+	defer file.close();
 
 	var reader_buf: [1024]u8 = undefined;
-	var reader = datafile.reader(&reader_buf);
+	var reader = file.reader(&reader_buf);
 
 	const now = std.time.timestamp();
 	var len_decr: u8 = undefined;
@@ -50,17 +50,17 @@ fn list(allocator: Allocator) !void {
 	defer allocator.free(title);
 	var time: i64 = undefined;
 	while (true) {
-		_ = reader.readStreaming(@ptrCast(&len_decr)) catch |err| switch (err) {
+		_ = reader.interface.readSliceAll(@ptrCast(&len_decr)) catch |err| switch (err) {
 			error.EndOfStream => break,
 			else => return err
 		};
 		title = try allocator.realloc(title, len_decr + 1);
-		_ = reader.read(title) catch |err| {
+		_ = reader.interface.readSliceAll(title) catch |err| {
 			errln("TODO fuck 0 {s}", .{@errorName(err)});
 			return err;
 		};
 
-		_ = reader.read(@ptrCast(&time)) catch |err| {
+		_ = reader.interface.readSliceAll(@ptrCast(&time)) catch |err| {
 			errln("TODO fuck 1", .{});
 			return err;
 		};
@@ -77,16 +77,16 @@ fn new(allocator: Allocator, entry: ?[]const u8) !void {
 		errln("Usage: destreak new <activity>", .{});
 		return error.Generic;
 	}
-	if (entry.?.len > 256) {
-		errln("Argument name too long! The maximum allowed length is 256 bytes.", .{});
+	if (entry.?.len == 0 or entry.?.len > 256) {
+		errln("Invalid name length! It should be between 1 and 256 bytes", .{});
 		return error.Generic;
 	}
 
-	var datafile = try open_datafile(allocator);
-	defer datafile.close();
+	var file = try open_file(allocator);
+	defer file.close();
 
-	var reader_buf: [1024]u8 = undefined;
-	var reader = datafile.reader(&reader_buf);
+	var reader_buf: [32]u8 = undefined;
+	var reader = file.reader(&reader_buf);
 
 	// TODO TEST
 	// Check if entry already exists
@@ -94,7 +94,7 @@ fn new(allocator: Allocator, entry: ?[]const u8) !void {
 	const title = try allocator.alloc(u8, entry.?.len);
 	defer allocator.free(title);
 	while (true) {
-		_ = reader.readStreaming(@ptrCast(&len_decr)) catch |err| switch (err) {
+		_ = reader.interface.readSliceAll(@ptrCast(&len_decr)) catch |err| switch (err) {
 			error.EndOfStream => break,
 			else => return err
 		};
@@ -102,7 +102,7 @@ fn new(allocator: Allocator, entry: ?[]const u8) !void {
 			try reader.seekBy(@intCast(len_decr + 1 + @sizeOf(i64)));
 			continue;
 		}
-		_ = try reader.read(title);
+		_ = try reader.interface.readSliceAll(title);
 		if (!eql(title, entry.?)) {
 			try reader.seekBy(@intCast(@sizeOf(i64)));
 			continue;
@@ -112,72 +112,71 @@ fn new(allocator: Allocator, entry: ?[]const u8) !void {
 		return error.Generic;
 	}
 
-	// Entry doesn't exist yet, so add it.
+	// Actually add entry
 	const now = std.time.timestamp();
 
-	var writer_buf: [1024]u8 = undefined;
-	var writer = datafile.writer(&writer_buf);
-	try writer.seekTo(try datafile.getEndPos());
+	var writer_buf: [32]u8 = undefined;
+	var writer = file.writer(&writer_buf);
+	try writer.seekTo(try file.getEndPos());
 	try writer.interface.writeByte(@intCast(entry.?.len - 1));
 	_ = try writer.interface.write(entry.?);
 	try writer.interface.writeInt(i64, now, .little);
 	try writer.interface.flush();
 }
 
+// TODO NOW DEBUG some EOF problems
 fn delete(allocator: Allocator, entry: ?[]const u8) !void {
 	if (entry == null) {
 		errln("Usage: destreak new <activity>", .{});
 		return error.Generic;
 	}
-	if (entry.?.len > 256) {
-		errln("Argument name too long! The maximum allowed length is 256 bytes.", .{});
+	if (entry.?.len == 0 or entry.?.len > 256) {
+		errln("Invalid name length! It should be between 1 and 256 bytes", .{});
 		return error.Generic;
 	}
 
-	var file = try open_datafile(allocator);
+	var file = try open_file(allocator);
 	defer file.close();
-
-	var reader_buf: [1024]u8 = undefined;
-	var writer_buf: [1024]u8 = undefined;
-	var reader = file.reader(&reader_buf);
-	var writer = file.writer(&writer_buf);
+	var reader = file.reader(&.{});
+	var writer = file.writer(&.{});
 
 	const title = try allocator.alloc(u8, entry.?.len);
 	defer allocator.free(title);
 
+	// Check if entry exists at all
 	var len_decr: u8 = undefined;
+	var TODO: usize = 0;
 	while (true) {
-		_ = reader.readStreaming(@ptrCast(&len_decr)) catch |err| switch (err) {
-			error.EndOfStream => break,
-			else => return err
+		_ = reader.interface.readSliceAll(@ptrCast(&len_decr)) catch {
+			errln("No such activity '{s}'", .{entry.?});
+			return error.Generic;
 		};
+		TODO += 1;
 		if (len_decr + 1 != entry.?.len) {
 			try reader.seekBy(@intCast(len_decr + 1 + @sizeOf(i64)));
 			continue;
 		}
-		_ = try reader.read(title);
-		if (!eql(title, entry.?)) {
-			try reader.seekBy(@intCast(@sizeOf(i64)));
-			continue;
-		}
+		_ = try reader.interface.readSliceAll(title);
+		TODO += title.len;
+		try reader.seekBy(@intCast(@sizeOf(i64)));
 
-		try writer.seekTo(reader.logicalPos() - @sizeOf(u8) - entry.?.len);
-		var copy_buf: [1024]u8 = undefined;
-		var n: usize = undefined;
-		while (true) {
-			n = reader.readStreaming(&copy_buf) catch |err| switch (err) {
-				error.EndOfStream => break,
-				else => return err
-			};
-			_ = try writer.interface.write(copy_buf[0..n]);
-		}
-		try writer.interface.flush();
-		try file.setEndPos(writer.pos);
-		return;
+		if (!eql(title, entry.?)) continue;
+		try writer.seekTo(TODO - @sizeOf(u8) - entry.?.len);
+		break;
 	}
 
-	// TODO TEST
-	errln("No such activity '{s}'", .{entry.?});
+	// Actually delete entry
+	try file.seekTo(reader.interface.seek);
+
+	var copy_buf: [32]u8 = undefined;
+	var n: usize = undefined;
+	while (true) {
+		n = try reader.interface.readSliceShort(&copy_buf);
+		if (n == 0) break;
+		_ = try writer.interface.write(copy_buf[0..n]);
+	}
+
+	try file.setEndPos(writer.pos);
 }
 
 fn help() void {
