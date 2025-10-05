@@ -30,7 +30,7 @@ pub fn open_datadir(allocator: Allocator) !std.fs.Dir {
 	return try std.fs.openDirAbsolute(dirpath, .{});
 }
 
-fn open_file(allocator: Allocator) !std.fs.File {
+fn open_datafile(allocator: Allocator) !std.fs.File {
 	var dir = try open_datadir(allocator);
 	defer dir.close();
 	return try dir.createFile("destreak.bin", .{ .read = true, .truncate = false });
@@ -38,7 +38,7 @@ fn open_file(allocator: Allocator) !std.fs.File {
 
 // TODO NOW DEBUG some EOF problems
 fn list(allocator: Allocator) !void {
-	var file = try open_file(allocator);
+	var file = try open_datafile(allocator);
 	defer file.close();
 
 	var reader_buf: [1024]u8 = undefined;
@@ -50,17 +50,17 @@ fn list(allocator: Allocator) !void {
 	defer allocator.free(title);
 	var time: i64 = undefined;
 	while (true) {
-		_ = reader.interface.readSliceAll(@ptrCast(&len_decr)) catch |err| switch (err) {
+		_ = reader.readPositional(@ptrCast(&len_decr)) catch |err| switch (err) {
 			error.EndOfStream => break,
 			else => return err
 		};
 		title = try allocator.realloc(title, len_decr + 1);
-		_ = reader.interface.readSliceAll(title) catch |err| {
+		_ = reader.readPositional(title) catch |err| {
 			errln("TODO fuck 0 {s}", .{@errorName(err)});
 			return err;
 		};
 
-		_ = reader.interface.readSliceAll(@ptrCast(&time)) catch |err| {
+		_ = reader.readPositional(@ptrCast(&time)) catch |err| {
 			errln("TODO fuck 1", .{});
 			return err;
 		};
@@ -82,7 +82,7 @@ fn new(allocator: Allocator, entry: ?[]const u8) !void {
 		return error.Generic;
 	}
 
-	var file = try open_file(allocator);
+	var file = try open_datafile(allocator);
 	defer file.close();
 
 	var reader_buf: [32]u8 = undefined;
@@ -94,7 +94,7 @@ fn new(allocator: Allocator, entry: ?[]const u8) !void {
 	const title = try allocator.alloc(u8, entry.?.len);
 	defer allocator.free(title);
 	while (true) {
-		_ = reader.interface.readSliceAll(@ptrCast(&len_decr)) catch |err| switch (err) {
+		_ = reader.readPositional(@ptrCast(&len_decr)) catch |err| switch (err) {
 			error.EndOfStream => break,
 			else => return err
 		};
@@ -102,14 +102,12 @@ fn new(allocator: Allocator, entry: ?[]const u8) !void {
 			try reader.seekBy(@intCast(len_decr + 1 + @sizeOf(i64)));
 			continue;
 		}
-		_ = try reader.interface.readSliceAll(title);
-		if (!eql(title, entry.?)) {
-			try reader.seekBy(@intCast(@sizeOf(i64)));
-			continue;
+		_ = try reader.readPositional(title);
+		if (eql(title, entry.?)) {
+			errln("'{s}' is already registered!", .{entry.?});
+			return error.Generic;
 		}
-
-		errln("'{s}' is already registered!", .{entry.?});
-		return error.Generic;
+		try reader.seekBy(@intCast(@sizeOf(i64)));
 	}
 
 	// Actually add entry
@@ -117,10 +115,12 @@ fn new(allocator: Allocator, entry: ?[]const u8) !void {
 
 	var writer_buf: [32]u8 = undefined;
 	var writer = file.writer(&writer_buf);
-	try writer.seekTo(try file.getEndPos());
+	try writer.seekTo(reader.pos);
+
 	try writer.interface.writeByte(@intCast(entry.?.len - 1));
 	_ = try writer.interface.write(entry.?);
 	try writer.interface.writeInt(i64, now, .little);
+
 	try writer.interface.flush();
 }
 
@@ -135,44 +135,46 @@ fn delete(allocator: Allocator, entry: ?[]const u8) !void {
 		return error.Generic;
 	}
 
-	var file = try open_file(allocator);
+	var file = try open_datafile(allocator);
 	defer file.close();
-	var reader = file.reader(&.{});
-	var writer = file.writer(&.{});
+
+	var reader_buf: [1024]u8 = undefined;
+	var writer_buf: [1024]u8 = undefined;
+	var reader = file.reader(&reader_buf);
+	var writer = file.writer(&writer_buf);
 
 	const title = try allocator.alloc(u8, entry.?.len);
 	defer allocator.free(title);
 
 	// Check if entry exists at all
 	var len_decr: u8 = undefined;
-	var TODO: usize = 0;
 	while (true) {
-		_ = reader.interface.readSliceAll(@ptrCast(&len_decr)) catch {
+		_ = reader.readPositional(@ptrCast(&len_decr)) catch {
 			errln("No such activity '{s}'", .{entry.?});
 			return error.Generic;
 		};
-		TODO += 1;
 		if (len_decr + 1 != entry.?.len) {
 			try reader.seekBy(@intCast(len_decr + 1 + @sizeOf(i64)));
 			continue;
 		}
-		_ = try reader.interface.readSliceAll(title);
-		TODO += title.len;
+		_ = try reader.readPositional(title);
 		try reader.seekBy(@intCast(@sizeOf(i64)));
 
-		if (!eql(title, entry.?)) continue;
-		try writer.seekTo(TODO - @sizeOf(u8) - entry.?.len);
-		break;
+		if (eql(title, entry.?)) {
+			const record_len = @sizeOf(u8) + entry.?.len + @sizeOf(i64);
+			try writer.seekTo(reader.pos - record_len);
+			break;
+		}
 	}
 
 	// Actually delete entry
-	try file.seekTo(reader.interface.seek);
-
 	var copy_buf: [32]u8 = undefined;
 	var n: usize = undefined;
 	while (true) {
-		n = try reader.interface.readSliceShort(&copy_buf);
-		if (n == 0) break;
+		n = reader.readStreaming(&copy_buf) catch |err| switch (err) {
+			error.EndOfStream => break,
+			else => return err
+		};
 		_ = try writer.interface.write(copy_buf[0..n]);
 	}
 
