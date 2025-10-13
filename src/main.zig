@@ -3,8 +3,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const AllocatorWrapper = @import("allocator.zig").AllocatorWrapper;
 
-var stderr_buf: [1024]u8 = undefined;
-var stdout_buf: [1024]u8 = undefined;
+var stderr_buf: [256]u8 = undefined;
+var stdout_buf: [256]u8 = undefined;
 var stderr = std.fs.File.stderr().writer(&stderr_buf);
 var stdout = std.fs.File.stdout().writer(&stdout_buf);
 
@@ -36,12 +36,11 @@ fn open_datafile(allocator: Allocator) !std.fs.File {
 	return try dir.createFile("destreak.bin", .{ .read = true, .truncate = false });
 }
 
-// TODO NOW DEBUG some EOF problems
 fn list(allocator: Allocator) !void {
 	var file = try open_datafile(allocator);
 	defer file.close();
 
-	var reader_buf: [1024]u8 = undefined;
+	var reader_buf: [256]u8 = undefined;
 	var reader = file.reader(&reader_buf);
 
 	const now = std.time.timestamp();
@@ -124,7 +123,6 @@ fn new(allocator: Allocator, entry: ?[]const u8) !void {
 	try writer.interface.flush();
 }
 
-// TODO NOW DEBUG some EOF problems
 fn delete(allocator: Allocator, entry: ?[]const u8) !void {
 	if (entry == null) {
 		errln("Usage: destreak new <activity>", .{});
@@ -138,8 +136,8 @@ fn delete(allocator: Allocator, entry: ?[]const u8) !void {
 	var file = try open_datafile(allocator);
 	defer file.close();
 
-	var reader_buf: [1024]u8 = undefined;
-	var writer_buf: [1024]u8 = undefined;
+	var reader_buf: [256]u8 = undefined;
+	var writer_buf: [256]u8 = undefined;
 	var reader = file.reader(&reader_buf);
 	var writer = file.writer(&writer_buf);
 
@@ -148,7 +146,7 @@ fn delete(allocator: Allocator, entry: ?[]const u8) !void {
 
 	// Check if entry exists at all
 	var len_decr: u8 = undefined;
-	while (true) {
+	const size_to_delete: u16 = while (true) {
 		_ = reader.readPositional(@ptrCast(&len_decr)) catch {
 			errln("No such activity '{s}'", .{entry.?});
 			return error.Generic;
@@ -161,13 +159,16 @@ fn delete(allocator: Allocator, entry: ?[]const u8) !void {
 		try reader.seekBy(@intCast(@sizeOf(i64)));
 
 		if (eql(title, entry.?)) {
-			const record_len = @sizeOf(u8) + entry.?.len + @sizeOf(i64);
-			try writer.seekTo(reader.pos - record_len);
-			break;
+			const result: u16 = @intCast(@sizeOf(u8) + title.len + @sizeOf(i64));
+			println("writerpos: {d}", .{writer.pos});
+			try writer.seekTo(reader.pos - result);
+			println("writerpos: {d} (should be {d})", .{writer.pos, reader.pos - result});
+			break result;
 		}
-	}
+	};
 
 	// Actually delete entry
+	println("file size before writing: {d}", .{try file.getEndPos()});
 	var copy_buf: [32]u8 = undefined;
 	var n: usize = undefined;
 	while (true) {
@@ -178,7 +179,9 @@ fn delete(allocator: Allocator, entry: ?[]const u8) !void {
 		_ = try writer.interface.write(copy_buf[0..n]);
 	}
 
-	try file.setEndPos(writer.pos);
+	try file.setEndPos(try file.getEndPos() - size_to_delete);
+	// TODO NOW NOTE flushing is the problem. it unnecessarily bloats the file. idky
+	try writer.interface.flush();
 }
 
 fn help() void {
