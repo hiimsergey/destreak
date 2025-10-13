@@ -37,26 +37,25 @@ fn list(allocator: Allocator) !void {
 	var file = try open_datafile(allocator);
 	defer file.close();
 
-	var reader_buf: [256]u8 = undefined;
+	var reader_buf: [128]u8 = undefined;
 	var reader = file.reader(&reader_buf);
 
 	const now = std.time.timestamp();
-	var len_decr: u8 = undefined;
+	var len_minus_one: u8 = undefined;
 	var title: []u8 = &.{};
 	defer allocator.free(title);
-	var time: i64 = undefined;
+	var timestamp: i64 = undefined;
 	while (true) {
-		_ = reader.readPositional(@ptrCast(&len_decr)) catch |err| switch (err) {
+		_ = reader.readPositional(@ptrCast(&len_minus_one)) catch |err| switch (err) {
 			error.EndOfStream => break,
 			else => return err
 		};
-		title = try allocator.realloc(title, len_decr + 1);
+		title = try allocator.realloc(title, len_minus_one + 1);
 		_ = try reader.readPositional(title);
 
-		_ = try reader.readPositional(@ptrCast(&time));
-		// TODO FINAL TEST
+		_ = try reader.readPositional(@ptrCast(&timestamp));
 		const days_since: u32 =
-			@intCast(@divFloor(now - time, std.time.s_per_day));
+			@intCast(@divFloor(now - timestamp, std.time.s_per_day));
 
 		println("{d:>4}  {s}", .{days_since, title});
 	}
@@ -75,21 +74,19 @@ fn new(allocator: Allocator, entry: ?[]const u8) !void {
 	var file = try open_datafile(allocator);
 	defer file.close();
 
-	var reader_buf: [32]u8 = undefined;
-	var reader = file.reader(&reader_buf);
+	var reader = file.reader(&.{});
 
-	// TODO TEST
 	// Check if entry already exists
-	var len_decr: u8 = undefined;
+	var len_minus_one: u8 = undefined;
 	const title = try allocator.alloc(u8, entry.?.len);
 	defer allocator.free(title);
 	while (true) {
-		_ = reader.readPositional(@ptrCast(&len_decr)) catch |err| switch (err) {
+		_ = reader.readPositional(@ptrCast(&len_minus_one)) catch |err| switch (err) {
 			error.EndOfStream => break,
 			else => return err
 		};
-		if (len_decr + 1 != entry.?.len) {
-			try reader.seekBy(@intCast(len_decr + 1 + @sizeOf(i64)));
+		if (len_minus_one + 1 != entry.?.len) {
+			try reader.seekBy(@intCast(len_minus_one + 1 + @sizeOf(i64)));
 			continue;
 		}
 		_ = try reader.readPositional(title);
@@ -112,6 +109,7 @@ fn new(allocator: Allocator, entry: ?[]const u8) !void {
 	try writer.interface.writeInt(i64, now, .little);
 
 	try writer.interface.flush();
+	return list(allocator);
 }
 
 fn delete(allocator: Allocator, entry: ?[]const u8) !void {
@@ -127,50 +125,46 @@ fn delete(allocator: Allocator, entry: ?[]const u8) !void {
 	var file = try open_datafile(allocator);
 	defer file.close();
 
-	// TODO NOW
-	var reader_buf: [256]u8 = undefined;
-	var writer_buf: [256]u8 = undefined;
-	var reader = file.reader(&reader_buf);
-	var writer = file.writer(&writer_buf);
+	var reader = file.reader(&.{});
+	var writer = file.writer(&.{});
 
 	const title = try allocator.alloc(u8, entry.?.len);
 	defer allocator.free(title);
 
 	// Check if entry exists at all
-	var len_decr: u8 = undefined;
-	const new_size: usize = while (true) {
-		_ = reader.readPositional(@ptrCast(&len_decr)) catch {
-			errln("No such activity '{s}'", .{entry.?});
+	var len_minus_one: u8 = undefined;
+	while (true) {
+		_ = reader.readPositional(@ptrCast(&len_minus_one)) catch {
+			errln("No such activity '{s}'!", .{entry.?});
 			return error.Generic;
 		};
-		if (len_decr + 1 != entry.?.len) {
-			try reader.seekBy(@intCast(len_decr + 1 + @sizeOf(i64)));
+		if (len_minus_one + 1 != entry.?.len) {
+			try reader.seekBy(@intCast(len_minus_one + 1 + @sizeOf(i64)));
 			continue;
 		}
 		_ = try reader.readPositional(title);
 		try reader.seekBy(@intCast(@sizeOf(i64)));
 
-		if (eql(title, entry.?)) {
-			const record_len: usize = @sizeOf(u8) + title.len + @sizeOf(i64);
-			try writer.seekTo(reader.pos - record_len);
-			const file_size: usize = @intCast(try file.getEndPos());
-			break file_size - record_len;
-		}
-	};
+		if (eql(title, entry.?)) break;
+	}
+
+	const file_size: usize = @intCast(try file.getEndPos());
+	const record_len: usize = @sizeOf(u8) + title.len + @sizeOf(i64);
+	try writer.seekTo(reader.pos - record_len);
 
 	// Actually delete entry
 	var copy_buf: [32]u8 = undefined;
 	var n: usize = undefined;
 	while (true) {
-		n = reader.readStreaming(&copy_buf) catch |err| switch (err) {
+		n = reader.read(&copy_buf) catch |err| switch (err) {
 			error.EndOfStream => break,
 			else => return err
 		};
 		_ = try writer.interface.write(copy_buf[0..n]);
 	}
 
-	try file.setEndPos(new_size);
-	try writer.interface.flush();
+	try file.setEndPos(file_size - record_len);
+	return list(allocator);
 }
 
 fn help() void {
@@ -189,16 +183,46 @@ fn help() void {
 		\\    or $HOME/.local/share/destreak.bin
 		\\
 		\\About:
-		\\    v0.0.0  GPL-3.0 license
+		\\    v0.1.0  GPL-3.0 license
 		\\    by Sergey Lavrent
 		\\    https://github.com/hiimsergey/destreak
 		, .{}
 	);
 }
 
-pub fn main() u8 {
-	defer stdout.interface.flush() catch {};
+fn reset(allocator: Allocator, arg: []const u8) !void {
+	var file = try open_datafile(allocator);
+	defer file.close();
 
+	var reader = file.reader(&.{});
+	var writer = file.writer(&.{});
+
+	const title = try allocator.alloc(u8, arg.len);
+	defer allocator.free(title);
+
+	// Check if entry exists at all
+	var len_minus_one: u8 = undefined;
+	while (true) {
+		_ = reader.readPositional(@ptrCast(&len_minus_one)) catch {
+			errln("No such activity '{s}'!", .{arg});
+			return error.Generic;
+		};
+		if (len_minus_one + 1 != arg.len) {
+			try reader.seekBy(@intCast(len_minus_one + 1 + @sizeOf(i64)));
+			continue;
+		}
+		_ = try reader.readPositional(title);
+		if (eql(title, arg)) break;
+	}
+
+	try writer.seekTo(reader.pos);
+	try writer.interface.writeInt(i64, std.time.timestamp(), .little);
+	try writer.interface.flush();
+
+	return list(allocator);
+}
+
+pub fn main() u8 {
 	var aw = AllocatorWrapper.init();
 	defer aw.deinit();
 	const allocator = aw.allocator();
@@ -216,13 +240,15 @@ pub fn main() u8 {
 		else if (eql(arg, "--help") or eql(arg, "-h")) {
 			help();
 			return 1;
-		} else {
+		} else if (std.mem.startsWith(u8, arg, "--")) {
 			errln(
 				"Invalid subcommand '{s}'!\nSee 'destreak help' for correct usage!",
 				.{arg}
 			);
 			return 1;
-		}
+		} else reset(allocator, arg) catch return 1;
 	} else list(allocator) catch return 1;
+
+	stdout.interface.flush() catch {};
 	return 0;
 }
