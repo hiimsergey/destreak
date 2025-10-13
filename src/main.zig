@@ -19,7 +19,7 @@ fn println(comptime fmt: []const u8, args: anytype) void {
 	stdout.interface.print(fmt ++ "\n", args) catch {};
 }
 
-pub fn open_datadir(allocator: Allocator) !std.fs.Dir {
+fn open_datafile(allocator: Allocator) !std.fs.File {
 	const dirpath = std.process.getEnvVarOwned(allocator, "XDG_DATA_HOME") catch blk: {
 		const home = try std.process.getEnvVarOwned(allocator, "HOME");
 		defer allocator.free(home);
@@ -27,12 +27,9 @@ pub fn open_datadir(allocator: Allocator) !std.fs.Dir {
 	};
 	defer allocator.free(dirpath);
 
-	return try std.fs.openDirAbsolute(dirpath, .{});
-}
-
-fn open_datafile(allocator: Allocator) !std.fs.File {
-	var dir = try open_datadir(allocator);
+	var dir = try std.fs.openDirAbsolute(dirpath, .{});
 	defer dir.close();
+
 	return try dir.createFile("destreak.bin", .{ .read = true, .truncate = false });
 }
 
@@ -54,15 +51,9 @@ fn list(allocator: Allocator) !void {
 			else => return err
 		};
 		title = try allocator.realloc(title, len_decr + 1);
-		_ = reader.readPositional(title) catch |err| {
-			errln("TODO fuck 0 {s}", .{@errorName(err)});
-			return err;
-		};
+		_ = try reader.readPositional(title);
 
-		_ = reader.readPositional(@ptrCast(&time)) catch |err| {
-			errln("TODO fuck 1", .{});
-			return err;
-		};
+		_ = try reader.readPositional(@ptrCast(&time));
 		// TODO FINAL TEST
 		const days_since: u32 =
 			@intCast(@divFloor(now - time, std.time.s_per_day));
@@ -136,6 +127,7 @@ fn delete(allocator: Allocator, entry: ?[]const u8) !void {
 	var file = try open_datafile(allocator);
 	defer file.close();
 
+	// TODO NOW
 	var reader_buf: [256]u8 = undefined;
 	var writer_buf: [256]u8 = undefined;
 	var reader = file.reader(&reader_buf);
@@ -146,7 +138,7 @@ fn delete(allocator: Allocator, entry: ?[]const u8) !void {
 
 	// Check if entry exists at all
 	var len_decr: u8 = undefined;
-	const size_to_delete: u16 = while (true) {
+	const new_size: usize = while (true) {
 		_ = reader.readPositional(@ptrCast(&len_decr)) catch {
 			errln("No such activity '{s}'", .{entry.?});
 			return error.Generic;
@@ -159,16 +151,14 @@ fn delete(allocator: Allocator, entry: ?[]const u8) !void {
 		try reader.seekBy(@intCast(@sizeOf(i64)));
 
 		if (eql(title, entry.?)) {
-			const result: u16 = @intCast(@sizeOf(u8) + title.len + @sizeOf(i64));
-			println("writerpos: {d}", .{writer.pos});
-			try writer.seekTo(reader.pos - result);
-			println("writerpos: {d} (should be {d})", .{writer.pos, reader.pos - result});
-			break result;
+			const record_len: usize = @sizeOf(u8) + title.len + @sizeOf(i64);
+			try writer.seekTo(reader.pos - record_len);
+			const file_size: usize = @intCast(try file.getEndPos());
+			break file_size - record_len;
 		}
 	};
 
 	// Actually delete entry
-	println("file size before writing: {d}", .{try file.getEndPos()});
 	var copy_buf: [32]u8 = undefined;
 	var n: usize = undefined;
 	while (true) {
@@ -179,8 +169,7 @@ fn delete(allocator: Allocator, entry: ?[]const u8) !void {
 		_ = try writer.interface.write(copy_buf[0..n]);
 	}
 
-	try file.setEndPos(try file.getEndPos() - size_to_delete);
-	// TODO NOW NOTE flushing is the problem. it unnecessarily bloats the file. idky
+	try file.setEndPos(new_size);
 	try writer.interface.flush();
 }
 
